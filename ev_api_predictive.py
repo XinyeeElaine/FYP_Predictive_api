@@ -88,7 +88,7 @@ def predict():
             
             # 3. Determine Status
             # Only two states: 'Normal' or 'Need Attention' (> 70%)
-            if prob > 0.70:
+            if prob > 0.60:
                 status = "Need Attention"
                 risk_level = "High" 
                 category = categorize_failure(root_cause)

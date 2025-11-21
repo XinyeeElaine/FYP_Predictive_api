@@ -26,49 +26,86 @@ except FileNotFoundError:
 
 # --- DIAGNOSTIC HELPER FUNCTIONS ---
 def get_root_cause(row_df, pipeline, feature_names, is_high_risk=False):
+    """
+    Attempts to find root cause using Z-scores.
+    If that fails, uses manual calculation but KEEPS the (Scorex) format.
+    """
+    # 1. Try Advanced Z-Score Method (The "Golden" way)
     try:
-        scaler = pipeline.named_steps['scaler']
-        means = scaler.mean_
-        scales = np.where(scaler.scale_ == 0, 1, scaler.scale_)
-        raw_values = row_df[feature_names].values.flatten()
-        z_scores = (raw_values - means) / scales
-        
-        contributions = []
-        for name, z in zip(feature_names, z_scores):
-            # We care about positive deviations (higher than normal)
-            if z > 0: contributions.append((name, z))
-        
-        contributions.sort(key=lambda x: x[1], reverse=True)
-        top_drivers = contributions[:3]
-        
-        # --- UPDATE: SMART THRESHOLD ---
-        # If the risk is High, we MUST find a reason, so we lower the threshold to 0.5.
-        # If risk is Low, we keep it strict (1.5) to avoid false alarms.
-        threshold = 0.5 if is_high_risk else 1.5
-
-        if not top_drivers or top_drivers[0][1] < threshold:
-            return "Normal Range"
-        
-        explanation = []
-        for feat, score in top_drivers:
-            # Clean up names for the user
-            readable = feat.replace('_roll_mean_14d', '').replace('_roll_mean_7d', '')\
-                           .replace('_roll_std_14d', ' Var').replace('_', ' ').title()
-            explanation.append(f"{readable} ({score:.1f}x)")
+        if 'scaler' in pipeline.named_steps:
+            scaler = pipeline.named_steps['scaler']
+            means = scaler.mean_
+            scales = np.where(scaler.scale_ == 0, 1, scaler.scale_)
+            raw_values = row_df[feature_names].values.flatten()
+            z_scores = (raw_values - means) / scales
             
-        return ", ".join(explanation)
+            contributions = []
+            for name, z in zip(feature_names, z_scores):
+                if z > 0: contributions.append((name, z))
+            
+            contributions.sort(key=lambda x: x[1], reverse=True)
+            top_drivers = contributions[:3]
+            
+            # Threshold: 0.5 if High Risk (aggressive), 1.5 if Low Risk (strict)
+            threshold = 0.5 if is_high_risk else 1.5
+
+            if top_drivers and top_drivers[0][1] >= threshold:
+                explanation = []
+                for feat, score in top_drivers:
+                    readable = feat.replace('_roll_mean_14d', '').replace('_roll_mean_7d', '')\
+                                   .replace('_roll_std_14d', ' Var').replace('_', ' ').title()
+                    explanation.append(f"{readable} ({score:.1f}x)")
+                return ", ".join(explanation)
+
     except Exception:
-        return "Diagnostics Unavailable"
+        # If math fails, silently pass to the fallback below
+        pass
+
+    # 2. Manual Fallback (The "Safety Net")
+    # This runs ONLY if Z-scores failed or found nothing, but the Risk is High.
+    if is_high_risk:
+        reasons = []
+        try:
+            # Check Voltage (Safety Limit: 0.1)
+            val_volt = row_df['voltage_instability'].values[0]
+            if val_volt > 0.1:
+                score = val_volt / 0.1
+                reasons.append(f"Voltage Instability ({score:.1f}x)")
+
+            # Check Temp (Safety Limit: 35)
+            val_temp = row_df['avg_peak_temp'].values[0]
+            if val_temp > 35:
+                score = val_temp / 35.0
+                reasons.append(f"Avg Peak Temp ({score:.1f}x)")
+
+            # Check Error Rate (Safety Limit: 0.05)
+            val_err = row_df['error_rate'].values[0]
+            if val_err > 0.05:
+                score = val_err / 0.05
+                reasons.append(f"Error Rate ({score:.1f}x)")
+            
+            # Check Utilization (Limit: 20 sessions)
+            val_sess = row_df['sessions_today'].values[0]
+            if val_sess > 20:
+                score = val_sess / 20.0
+                reasons.append(f"High Utilization ({score:.1f}x)")
+
+            if reasons:
+                return ", ".join(reasons)
+            
+            return "Anomaly Detected (1.0x)"
+            
+        except Exception:
+            return "Data Error"
+
+    return "Normal Range"
 
 def categorize_failure(text):
-    # This creates the "Problem Found" text (e.g., OVERHEATING)
-    if "Temp" in text: return "OVERHEATING"
-    if "Volt" in text: return "POWER SURGE"
-    if "Error" in text: return "SOFTWARE CRASH"
-    
-    # If we have a generic variance but no specific keyword matches
-    if "Var" in text: return "SIGNAL INSTABILITY"
-    
+    text = text.upper()
+    if "TEMP" in text: return "OVERHEATING"
+    if "VOLT" in text: return "POWER SURGE"
+    if "ERROR" in text or "SOFTWARE" in text: return "SOFTWARE CRASH"
+    if "VAR" in text or "INSTABILITY" in text: return "SIGNAL INSTABILITY"
     return "PERFORMANCE DEGRADATION"
 
 # --- API ENDPOINT ---
@@ -93,8 +130,7 @@ def predict():
         for i, prob in enumerate(probabilities):
             prob_val = float(prob)
             
-            # 2. Determine Status FIRST (so we know if we need to force a diagnosis)
-            # Note: I see you used 0.60 in your code.
+            # 2. Determine Status (Threshold 0.60)
             if prob_val > 0.60:
                 status = "Need Attention"
                 risk_level = "High" 
@@ -104,9 +140,8 @@ def predict():
                 risk_level = "Low"
                 is_risk_high = False
 
-            # 3. Run Diagnostics with the new 'is_high_risk' flag
-            row_data = df_final.iloc[[i]]
-            root_cause = get_root_cause(row_data, pipeline, model_features, is_high_risk=is_risk_high)
+            # 3. Run Diagnostics
+            root_cause = get_root_cause(df_final.iloc[[i]], pipeline, model_features, is_high_risk=is_risk_high)
             
             # 4. Categorize
             if is_risk_high:

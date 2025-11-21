@@ -25,8 +25,7 @@ except FileNotFoundError:
     sys.exit(1)
 
 # --- DIAGNOSTIC HELPER FUNCTIONS ---
-# These live here because the API needs to calculate the root cause before responding.
-def get_root_cause(row_df, pipeline, feature_names):
+def get_root_cause(row_df, pipeline, feature_names, is_high_risk=False):
     try:
         scaler = pipeline.named_steps['scaler']
         means = scaler.mean_
@@ -36,12 +35,18 @@ def get_root_cause(row_df, pipeline, feature_names):
         
         contributions = []
         for name, z in zip(feature_names, z_scores):
+            # We care about positive deviations (higher than normal)
             if z > 0: contributions.append((name, z))
         
         contributions.sort(key=lambda x: x[1], reverse=True)
         top_drivers = contributions[:3]
         
-        if not top_drivers or top_drivers[0][1] < 1.5:
+        # --- UPDATE: SMART THRESHOLD ---
+        # If the risk is High, we MUST find a reason, so we lower the threshold to 0.5.
+        # If risk is Low, we keep it strict (1.5) to avoid false alarms.
+        threshold = 0.5 if is_high_risk else 1.5
+
+        if not top_drivers or top_drivers[0][1] < threshold:
             return "Normal Range"
         
         explanation = []
@@ -56,10 +61,15 @@ def get_root_cause(row_df, pipeline, feature_names):
         return "Diagnostics Unavailable"
 
 def categorize_failure(text):
+    # This creates the "Problem Found" text (e.g., OVERHEATING)
     if "Temp" in text: return "OVERHEATING"
     if "Volt" in text: return "POWER SURGE"
     if "Error" in text: return "SOFTWARE CRASH"
-    return "UNKNOWN"
+    
+    # If we have a generic variance but no specific keyword matches
+    if "Var" in text: return "SIGNAL INSTABILITY"
+    
+    return "PERFORMANCE DEGRADATION"
 
 # --- API ENDPOINT ---
 @app.route('/predict', methods=['POST'])
@@ -81,25 +91,33 @@ def predict():
 
         results = []
         for i, prob in enumerate(probabilities):
-            # 2. Run Diagnostics for this specific row
-            row_data = df_final.iloc[[i]]
-            root_cause = get_root_cause(row_data, pipeline, model_features)
-            category = "-"
+            prob_val = float(prob)
             
-            # 3. Determine Status
-            # Only two states: 'Normal' or 'Need Attention' (> 70%)
-            if prob > 0.60:
+            # 2. Determine Status FIRST (so we know if we need to force a diagnosis)
+            # Note: I see you used 0.60 in your code.
+            if prob_val > 0.60:
                 status = "Need Attention"
                 risk_level = "High" 
-                category = categorize_failure(root_cause)
+                is_risk_high = True
             else:
                 status = "Normal"
                 risk_level = "Low"
+                is_risk_high = False
+
+            # 3. Run Diagnostics with the new 'is_high_risk' flag
+            row_data = df_final.iloc[[i]]
+            root_cause = get_root_cause(row_data, pipeline, model_features, is_high_risk=is_risk_high)
+            
+            # 4. Categorize
+            if is_risk_high:
+                category = categorize_failure(root_cause)
+            else:
+                category = "-"
 
             results.append({
                 'status': status,
                 'risk_level': risk_level,
-                'probability': float(prob),
+                'probability': prob_val,
                 'failure_category': category,
                 'root_cause': root_cause
             })

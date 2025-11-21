@@ -87,16 +87,14 @@ def predict():
             category = "-"
             
             # 3. Determine Status
-            status = "Normal"
-            risk_level = "Low"
-            if prob > 0.75:
-                status = "FAILURE ALERT"
-                risk_level = "CRITICAL ☢️"
+            # Only two states: 'Normal' or 'Need Attention' (> 70%)
+            if prob > 0.70:
+                status = "Need Attention"
+                risk_level = "High" 
                 category = categorize_failure(root_cause)
-            elif prob > 0.30:
-                status = "WARNING"
-                risk_level = "Medium ⚠️"
-                category = categorize_failure(root_cause)
+            else:
+                status = "Normal"
+                risk_level = "Low"
 
             results.append({
                 'status': status,

@@ -30,7 +30,7 @@ def get_root_cause(row_df, pipeline, feature_names, is_high_risk=False):
     Attempts to find root cause using Z-scores.
     If that fails, uses manual calculation but KEEPS the (Scorex) format.
     """
-    # 1. Try Advanced Z-Score Method (The "Golden" way)
+    # 1. Try Advanced Z-Score Method
     try:
         if 'scaler' in pipeline.named_steps:
             scaler = pipeline.named_steps['scaler']
@@ -66,26 +66,30 @@ def get_root_cause(row_df, pipeline, feature_names, is_high_risk=False):
     if is_high_risk:
         reasons = []
         try:
+            # Helper to safely get value (returns 0.0 if column missing)
+            def get_val(col):
+                return row_df[col].values[0] if col in row_df.columns else 0.0
+
             # Check Voltage (Safety Limit: 0.1)
-            val_volt = row_df['voltage_instability'].values[0]
+            val_volt = get_val('voltage_instability')
             if val_volt > 0.1:
                 score = val_volt / 0.1
                 reasons.append(f"Voltage Instability ({score:.1f}x)")
 
             # Check Temp (Safety Limit: 35)
-            val_temp = row_df['avg_peak_temp'].values[0]
+            val_temp = get_val('avg_peak_temp')
             if val_temp > 35:
                 score = val_temp / 35.0
                 reasons.append(f"Avg Peak Temp ({score:.1f}x)")
 
             # Check Error Rate (Safety Limit: 0.05)
-            val_err = row_df['error_rate'].values[0]
+            val_err = get_val('error_rate')
             if val_err > 0.05:
                 score = val_err / 0.05
                 reasons.append(f"Error Rate ({score:.1f}x)")
             
             # Check Utilization (Limit: 20 sessions)
-            val_sess = row_df['sessions_today'].values[0]
+            val_sess = get_val('sessions_today')
             if val_sess > 20:
                 score = val_sess / 20.0
                 reasons.append(f"High Utilization ({score:.1f}x)")

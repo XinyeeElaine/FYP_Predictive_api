@@ -31,15 +31,13 @@ def align_features(input_df, target_features):
     """
     1. Maps PHP keys to Model keys.
     2. Generates missing Time data.
-    3. Synthesizes missing History data.
+    3. Synthesizes missing History data (Preprocessing only).
     4. ENFORCES STRICT COLUMN ORDER.
     """
-    # Start with a clean DataFrame
     aligned_df = pd.DataFrame(index=input_df.index)
     
     # 1. Generate Time Features (Critical for Model)
     now = datetime.now()
-    # We assign these to temporary variables, we will map them into the DF inside the loop
     current_month = now.month
     current_day = now.weekday()
 
@@ -82,7 +80,6 @@ def align_features(input_df, target_features):
                     break
                 
                 # 2. Rolling Mean Filling (Use raw value to fill missing history)
-                # Example: Use 'avg_peak_temp' to fill 'avg_peak_temp_roll_mean_7d'
                 if 'mean' in feature and php_key in feature:
                      aligned_df[feature] = input_df[php_key]
                      found = True
@@ -91,28 +88,22 @@ def align_features(input_df, target_features):
         if found: continue
 
         # --- D. Synthesize Standard Deviation ---
-        # If we need 'std' (variance) but don't have it, calculate 5% of the 'mean'
+        # (This is PREPROCESSING, not an override. We need valid inputs for the AI.)
         if 'std' in feature:
-            # Try to find the mean version of this column (e.g. roll_mean_14d)
             base_mean_name = feature.replace('_std', '_mean')
-            
-            # If we successfully created the mean column earlier in this loop:
             if base_mean_name in aligned_df.columns:
                 aligned_df[feature] = aligned_df[base_mean_name] * 0.05
                 continue
             
-            # Fallback: Find raw PHP key
-            root_name = feature.split('_roll')[0] # e.g. avg_peak_temp
+            root_name = feature.split('_roll')[0]
             if root_name in input_df.columns:
                  aligned_df[feature] = input_df[root_name] * 0.05
                  continue
 
         # --- E. Final Fallback ---
-        # If absolutely nothing matches, fill with 0 to prevent crashes
         aligned_df[feature] = 0.0
 
-    # 4. STRICT REORDERING (The Fix for your Error)
-    # Ensure the dataframe has exactly the columns the model expects, in order.
+    # 4. STRICT REORDERING (Prevents "Feature names must match" error)
     aligned_df = aligned_df[target_features]
     
     return aligned_df
@@ -120,26 +111,20 @@ def align_features(input_df, target_features):
 # --- DIAGNOSTICS ---
 def get_root_cause(row_df, is_high_risk=False):
     reasons = []
-    def val(col): return row_df.get(col, 0)
-
-    # Use raw names here because we are looking at the aligned DF
-    # Note: The aligned DF will have the MODEL's column names now.
     
-    # We try to guess the column names based on standard conventions
+    # We inspect the ALIGNED data (what the model saw)
     t = 0
     v = 0
     e = 0
 
-    # Find the temperature column
+    # Helper to find values in the aligned dataframe regardless of naming variations
     for col in row_df.index:
         if 'avg_peak_temp' in col and 'mean' not in col: t = row_df[col]; break
-        if 'temperature' in col and 'mean' not in col: t = row_df[col]; break
+        elif 'temperature' in col and 'mean' not in col: t = row_df[col]; break
     
-    # Find voltage
     for col in row_df.index:
         if 'voltage' in col and 'mean' not in col: v = row_df[col]; break
     
-    # Find error
     for col in row_df.index:
         if 'error' in col and 'mean' not in col: e = row_df[col]; break
 
@@ -168,46 +153,41 @@ def predict():
         
         df_raw = pd.DataFrame(data)
         
-        # 1. Align & Reorder Features
+        # 1. Align & Reorder Features (Data Prep)
         df_final = align_features(df_raw, model_features)
 
-        # 2. Predict (Now safe because columns match exactly)
+        # 2. Predict (PURE AI - No Manual Rules)
         probabilities = pipeline.predict_proba(df_final)[:, 1]
 
         results = []
         for i, prob in enumerate(probabilities):
             prob_val = float(prob)
             
-            # --- OVERRIDE LOGIC ---
-            # Extract raw values from the CLEAN dataframe for checking
-            # We look for the main columns to apply overrides
+            # 3. Determine Status (Strictly > 0.60)
+            if prob_val > 0.60:
+                status = "Need Attention"
+                risk_level = "High" 
+                is_risk_high = True
+            else:
+                status = "Normal"
+                risk_level = "Low"
+                is_risk_high = False
+
+            # 4. Run Diagnostics (For UI explanation only)
+            root_cause = get_root_cause(df_final.iloc[i], is_high_risk=is_risk_high)
             
-            # Find Temp Value
-            raw_temp = 0
-            if 'avg_peak_temp' in df_final.columns: raw_temp = df_final.iloc[i]['avg_peak_temp']
-            elif 'temperature' in df_final.columns: raw_temp = df_final.iloc[i]['temperature']
-            elif 'avg_peak_temp_roll_mean_14d' in df_final.columns: raw_temp = df_final.iloc[i]['avg_peak_temp_roll_mean_14d']
-
-            # Find Error Value
-            raw_err = 0
-            if 'error_rate' in df_final.columns: raw_err = df_final.iloc[i]['error_rate']
-            elif 'error_rate_roll_mean_14d' in df_final.columns: raw_err = df_final.iloc[i]['error_rate_roll_mean_14d']
-
-            # Apply Logic
-            if raw_temp > 80: prob_val = max(prob_val, 0.98)
-            if raw_err > 0.2: prob_val = max(prob_val, 0.95)
-
-            is_high = prob_val > 0.55
-            
-            # Diagnostics
-            root_cause = get_root_cause(df_final.iloc[i], is_high)
+            # 5. Categorize
+            if is_risk_high:
+                category = categorize_failure(root_cause)
+            else:
+                category = "-"
 
             results.append({
-                'status': "Need Attention" if is_high else "Normal",
-                'risk_level': "High" if is_high else "Low",
+                'status': status,
+                'risk_level': risk_level,
                 'probability': round(prob_val, 4),
-                'root_cause': root_cause,
-                'failure_category': categorize_failure(root_cause) if is_high else "-"
+                'failure_category': category,
+                'root_cause': root_cause
             })
 
         return jsonify(results)

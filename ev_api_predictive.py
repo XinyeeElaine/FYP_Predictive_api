@@ -36,12 +36,12 @@ def align_features(input_df, target_features):
     """
     aligned_df = pd.DataFrame(index=input_df.index)
     
-    # 1. Generate Time Features (Critical for Model)
+    # 1. Generate Time Features
     now = datetime.now()
     current_month = now.month
     current_day = now.weekday()
 
-    # 2. Dictionary: PHP Name -> Potential Model Name Match
+    # 2. Dictionary: PHP Name -> Model Name
     alias_map = {
         'avg_peak_temp': ['avg_peak_temp', 'temperature', 'temp'],
         'voltage_instability': ['voltage_instability', 'voltage', 'variance'],
@@ -50,10 +50,10 @@ def align_features(input_df, target_features):
         'ambient_temp': ['ambient_temp', 'ambient']
     }
 
-    # 3. Build the DataFrame column by column based on what the MODEL needs
+    # 3. Build DataFrame
     for feature in target_features:
         
-        # --- A. Time Features ---
+        # A. Time Features
         if feature == 'month_of_year':
             aligned_df[feature] = current_month
             continue
@@ -64,30 +64,28 @@ def align_features(input_df, target_features):
             aligned_df[feature] = 0.0
             continue
 
-        # --- B. Direct Match ---
+        # B. Direct Match
         if feature in input_df.columns:
             aligned_df[feature] = input_df[feature]
             continue
             
-        # --- C. Synonym Match ---
+        # C. Synonym Match
         found = False
         for php_key, aliases in alias_map.items():
             if php_key in input_df.columns:
-                # 1. Exact alias match
                 if feature in aliases:
                     aligned_df[feature] = input_df[php_key]
                     found = True
                     break
                 
-                # 2. Rolling Mean Filling
+                # Rolling Mean Filling
                 if 'mean' in feature and php_key in feature:
                      aligned_df[feature] = input_df[php_key]
                      found = True
                      break
-        
         if found: continue
 
-        # --- D. Synthesize Standard Deviation ---
+        # D. Synthesize Standard Deviation
         if 'std' in feature:
             base_mean_name = feature.replace('_std', '_mean')
             if base_mean_name in aligned_df.columns:
@@ -99,7 +97,7 @@ def align_features(input_df, target_features):
                  aligned_df[feature] = input_df[root_name] * 0.05
                  continue
 
-        # --- E. Final Fallback ---
+        # E. Final Fallback
         aligned_df[feature] = 0.0
 
     # 4. STRICT REORDERING
@@ -150,19 +148,8 @@ def predict():
         
         df_raw = pd.DataFrame(data)
         
-        # 1. Align & Reorder Features
+        # 1. Align Features
         df_final = align_features(df_raw, model_features)
-
-        # --- DEBUG: SCAN FOR DANGER ---
-        # We assume danger if Voltage > 15% unstable OR Temp > 80C
-        # We print these rows explicitly to verify the PHP is sending bad data
-        for idx, row in df_final.iterrows():
-            # Check Voltage Instability (usually index 6 in strict order, but we use name)
-            v = row.get('voltage_instability', 0)
-            t = row.get('avg_peak_temp', 0)
-            
-            if v > 0.10 or t > 80:
-                print(f"⚠️ DANGER INPUT DETECTED [Row {idx}]: Temp={t:.1f}, VoltInst={v:.3f}", flush=True)
 
         # 2. Predict
         probabilities = pipeline.predict_proba(df_final)[:, 1]
@@ -171,12 +158,24 @@ def predict():
         for i, prob in enumerate(probabilities):
             prob_val = float(prob)
             
-            if prob_val > 0.60:
+            # --- DEBUG LOGGING (UPDATED) ---
+            # Print probability for EVERY row to debug
+            risk_label = "LOW"
+            if prob_val > 0.50: risk_label = "HIGH"
+            
+            # Print only if it's interesting (either dangerous input or high result)
+            raw_v = df_final.iloc[i].get('voltage_instability', 0)
+            raw_t = df_final.iloc[i].get('avg_peak_temp', 0)
+            
+            if prob_val > 0.50 or raw_v > 0.10 or raw_t > 80:
+                print(f"📊 [Row {i}] {risk_label} RISK | Prob: {prob_val:.4f} | Input: T={raw_t:.1f}, V={raw_v:.3f}", flush=True)
+
+            # 3. Determine Status (Threshold 0.50)
+            # Lowered from 0.60 to 0.50 to catch more faults
+            if prob_val > 0.50:
                 status = "Need Attention"
                 risk_level = "High" 
                 is_risk_high = True
-                # Log High Risk Predictions
-                print(f"🔥 HIGH RISK PREDICTION [Row {i}]: Probability {prob_val:.4f}", flush=True)
             else:
                 status = "Normal"
                 risk_level = "Low"

@@ -19,153 +19,159 @@ try:
     data_pkg = joblib.load(model_path)
     pipeline = data_pkg['pipeline']
     model_features = data_pkg['features']
-    print(f"✅ SUCCESS: Loaded Golden Model with {len(model_features)} features.")
+    print(f" SUCCESS: Loaded Model with {len(model_features)} features.")
+    print(f" MODEL EXPECTS: {model_features}") 
 except FileNotFoundError:
-    print(f"❌ FATAL: '{MODEL_FILE}' not found.")
+    print(f" FATAL: '{MODEL_FILE}' not found.")
     sys.exit(1)
 
-# --- DIAGNOSTIC HELPER FUNCTIONS ---
-def get_root_cause(row_df, pipeline, feature_names, is_high_risk=False):
+# --- INTELLIGENT FEATURE ALIGNER (The Fix) ---
+def align_features(input_df, target_features):
     """
-    Attempts to find root cause using Z-scores.
-    If that fails, uses manual calculation but KEEPS the (Scorex) format.
+    Maps incoming PHP keys to Model keys and fills missing data intelligently.
     """
-    # 1. Try Advanced Z-Score Method
-    try:
-        if 'scaler' in pipeline.named_steps:
-            scaler = pipeline.named_steps['scaler']
-            means = scaler.mean_
-            scales = np.where(scaler.scale_ == 0, 1, scaler.scale_)
-            raw_values = row_df[feature_names].values.flatten()
-            z_scores = (raw_values - means) / scales
+    aligned_df = pd.DataFrame(index=input_df.index)
+    
+    # 1. Dictionary of Synonyms (PHP Name -> Potential Model Names)
+    # We map the INPUT (PHP) to the TARGET (Model)
+    alias_map = {
+        'avg_peak_temp': ['temperature', 'temp', 'peak_temp', 'avg_temp'],
+        'voltage_instability': ['voltage', 'volt', 'variance', 'instability'],
+        'error_rate': ['error', 'errors', 'fail_rate'],
+        'sessions_today': ['sessions', 'utilization', 'usage'],
+        
+        # Rolling features
+        'avg_peak_temp_roll_mean_14d': ['temperature_roll_mean', 'temp_roll_mean', 'avg_peak_temp_roll_mean'],
+        'voltage_instability_roll_mean_14d': ['voltage_roll_mean', 'volt_roll_mean'],
+    }
+
+    # 2. Iterate through what the MODEL needs
+    for feature in target_features:
+        
+        # Case A: Exact Match
+        if feature in input_df.columns:
+            aligned_df[feature] = input_df[feature]
+            continue
             
-            contributions = []
-            for name, z in zip(feature_names, z_scores):
-                if z > 0: contributions.append((name, z))
-            
-            contributions.sort(key=lambda x: x[1], reverse=True)
-            top_drivers = contributions[:3]
-            
-            # Threshold: 0.5 if High Risk (aggressive), 1.5 if Low Risk (strict)
-            threshold = 0.5 if is_high_risk else 1.5
+        # Case B: Synonym Match
+        found = False
+        for php_key, aliases in alias_map.items():
+            if php_key in input_df.columns:
+                # Check if the target feature matches one of the aliases
+                if feature in aliases:
+                    aligned_df[feature] = input_df[php_key]
+                    found = True
+                    print(f"    Mapped '{php_key}' -> '{feature}'")
+                    break
+                # Check if partial string match (e.g. 'temp' in 'avg_peak_temp')
+                # This is aggressive matching for rolling means
+                if not found and php_key in feature and 'roll' in feature:
+                     aligned_df[feature] = input_df[php_key]
+                     found = True
+                     print(f"    Fuzzy Mapped '{php_key}' -> '{feature}'")
+                     break
 
-            if top_drivers and top_drivers[0][1] >= threshold:
-                explanation = []
-                for feat, score in top_drivers:
-                    readable = feat.replace('_roll_mean_14d', '').replace('_roll_mean_7d', '')\
-                                   .replace('_roll_std_14d', ' Var').replace('_', ' ').title()
-                    explanation.append(f"{readable} ({score:.1f}x)")
-                return ", ".join(explanation)
+        if found: continue
 
-    except Exception:
-        # If math fails, silently pass to the fallback below
-        pass
+        # Case C: Synthesize Missing History (The "Zero Fix")
+        # If the model needs 'std' (Standard Deviation) but we only have 'mean',
+        # we simulate 'std' as 10% of the mean to avoid 0 values.
+        if 'std' in feature or 'var' in feature:
+            # Find the corresponding 'mean' column in our aligned_df
+            base_name = feature.replace('std', 'mean').replace('var', 'mean')
+            if base_name in aligned_df.columns:
+                aligned_df[feature] = aligned_df[base_name] * 0.1 # Assume 10% variance
+                print(f"   🧪 Synthesized '{feature}' from '{base_name}'")
+                continue
 
-    # 2. Manual Fallback (The "Safety Net")
-    # This runs ONLY if Z-scores failed or found nothing, but the Risk is High.
-    if is_high_risk:
-        reasons = []
-        try:
-            # Helper to safely get value (returns 0.0 if column missing)
-            def get_val(col):
-                return row_df[col].values[0] if col in row_df.columns else 0.0
+        # Case D: Fallback to 0 (Log warning)
+        print(f"   ⚠️ Missing Feature: '{feature}'. Defaulting to 0.")
+        aligned_df[feature] = 0.0
 
-            # Check Voltage (Safety Limit: 0.1)
-            val_volt = get_val('voltage_instability')
-            if val_volt > 0.1:
-                score = val_volt / 0.1
-                reasons.append(f"Voltage Instability ({score:.1f}x)")
+    return aligned_df
 
-            # Check Temp (Safety Limit: 35)
-            val_temp = get_val('avg_peak_temp')
-            if val_temp > 35:
-                score = val_temp / 35.0
-                reasons.append(f"Avg Peak Temp ({score:.1f}x)")
+# --- DIAGNOSTIC HELPERS ---
+def get_root_cause(row_df, is_high_risk=False):
+    """Simplified Root Cause Analysis"""
+    reasons = []
+    
+    # Extract values regardless of column name
+    def get_val(keywords):
+        for col in row_df.index:
+            if any(k in col for k in keywords):
+                return row_df[col]
+        return 0.0
 
-            # Check Error Rate (Safety Limit: 0.05)
-            val_err = get_val('error_rate')
-            if val_err > 0.05:
-                score = val_err / 0.05
-                reasons.append(f"Error Rate ({score:.1f}x)")
-            
-            # Check Utilization (Limit: 20 sessions)
-            val_sess = get_val('sessions_today')
-            if val_sess > 20:
-                score = val_sess / 20.0
-                reasons.append(f"High Utilization ({score:.1f}x)")
+    val_temp = get_val(['temp', 'Temp'])
+    val_volt = get_val(['volt', 'Volt', 'instability'])
+    val_err = get_val(['error', 'Error'])
 
-            if reasons:
-                return ", ".join(reasons)
-            
-            return "Anomaly Detected (1.0x)"
-            
-        except Exception:
-            return "Data Error"
-
-    return "Normal Range"
+    if val_temp > 50: reasons.append(f"Overheating ({val_temp:.1f}°C)")
+    if val_volt > 0.15: reasons.append(f"Voltage Instability ({val_volt:.2f})")
+    if val_err > 0.1: reasons.append(f"High Error Rate")
+    
+    if not reasons and is_high_risk:
+        return "Anomaly Detected (Pattern)"
+        
+    return ", ".join(reasons) if reasons else "Normal Range"
 
 def categorize_failure(text):
-    text = text.upper()
-    if "TEMP" in text: return "OVERHEATING"
-    if "VOLT" in text: return "POWER SURGE"
-    if "ERROR" in text or "SOFTWARE" in text: return "SOFTWARE CRASH"
-    if "VAR" in text or "INSTABILITY" in text: return "SIGNAL INSTABILITY"
-    return "PERFORMANCE DEGRADATION"
+    text = str(text).upper()
+    if "OVERHEATING" in text or "TEMP" in text: return "OVERHEATING"
+    if "VOLTAGE" in text or "INSTABILITY" in text: return "POWER QUALITY"
+    if "ERROR" in text: return "SOFTWARE ERROR"
+    return "PREDICTIVE ALERT"
 
 # --- API ENDPOINT ---
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
         data = request.get_json()
-        if not isinstance(data, list):
-            data = [data]
+        if not isinstance(data, list): data = [data]
+        
+        # 1. Raw Data
+        df_raw = pd.DataFrame(data)
+        print(f"\n📥 Received: {len(df_raw)} records. Cols: {list(df_raw.columns)}")
 
-        df = pd.DataFrame(data)
+        # 2. Align Features (Mapping)
+        df_final = align_features(df_raw, model_features)
 
-        # Fill missing columns
-        for col in model_features:
-            if col not in df.columns: df[col] = 0.0
-        df_final = df[model_features]
-
-        # 1. Predict Probability
+        # 3. Predict
         probabilities = pipeline.predict_proba(df_final)[:, 1]
 
         results = []
         for i, prob in enumerate(probabilities):
             prob_val = float(prob)
             
-            # 2. Determine Status (Threshold 0.60)
-            if prob_val > 0.60:
-                status = "Need Attention"
-                risk_level = "High" 
-                is_risk_high = True
-            else:
-                status = "Normal"
-                risk_level = "Low"
-                is_risk_high = False
+            # --- DEBUG OVERRIDE ---
+            # If auto-mapping failed to convince the model, use Physics rules
+            raw_temp = df_final.iloc[i].get('avg_peak_temp', 0) 
+            # Try multiple names for temp in case mapping renamed it
+            if raw_temp == 0: 
+                raw_temp = df_final.iloc[i].get('temperature', df_final.iloc[i].get('temp', 0))
 
-            # 3. Run Diagnostics
-            root_cause = get_root_cause(df_final.iloc[[i]], pipeline, model_features, is_high_risk=is_risk_high)
+            if raw_temp > 80: prob_val = max(prob_val, 0.95) # Force High
+            if df_final.iloc[i].get('error_rate', 0) > 0.5: prob_val = max(prob_val, 0.90)
+
+            # Status Logic
+            is_high = prob_val > 0.55
             
-            # 4. Categorize
-            if is_risk_high:
-                category = categorize_failure(root_cause)
-            else:
-                category = "-"
-
             results.append({
-                'status': status,
-                'risk_level': risk_level,
-                'probability': prob_val,
-                'failure_category': category,
-                'root_cause': root_cause
+                'status': "Need Attention" if is_high else "Normal",
+                'risk_level': "High" if is_high else "Low",
+                'probability': round(prob_val, 4),
+                'root_cause': get_root_cause(df_final.iloc[i], is_high),
+                'failure_category': categorize_failure(get_root_cause(df_final.iloc[i], is_high)) if is_high else "-"
             })
 
         return jsonify(results)
 
     except Exception as e:
+        print(f" ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    print("Starting Diagnostic Server on Port 5000...")
+    print("Starting Intelligent Diagnostic Server on Port 5000...")
     serve(app, host='0.0.0.0', port=5000)

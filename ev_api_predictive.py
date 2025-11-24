@@ -79,7 +79,7 @@ def align_features(input_df, target_features):
                     found = True
                     break
                 
-                # 2. Rolling Mean Filling (Use raw value to fill missing history)
+                # 2. Rolling Mean Filling
                 if 'mean' in feature and php_key in feature:
                      aligned_df[feature] = input_df[php_key]
                      found = True
@@ -88,7 +88,6 @@ def align_features(input_df, target_features):
         if found: continue
 
         # --- D. Synthesize Standard Deviation ---
-        # (This is PREPROCESSING, not an override. We need valid inputs for the AI.)
         if 'std' in feature:
             base_mean_name = feature.replace('_std', '_mean')
             if base_mean_name in aligned_df.columns:
@@ -103,7 +102,7 @@ def align_features(input_df, target_features):
         # --- E. Final Fallback ---
         aligned_df[feature] = 0.0
 
-    # 4. STRICT REORDERING (Prevents "Feature names must match" error)
+    # 4. STRICT REORDERING
     aligned_df = aligned_df[target_features]
     
     return aligned_df
@@ -112,12 +111,10 @@ def align_features(input_df, target_features):
 def get_root_cause(row_df, is_high_risk=False):
     reasons = []
     
-    # We inspect the ALIGNED data (what the model saw)
     t = 0
     v = 0
     e = 0
 
-    # Helper to find values in the aligned dataframe regardless of naming variations
     for col in row_df.index:
         if 'avg_peak_temp' in col and 'mean' not in col: t = row_df[col]; break
         elif 'temperature' in col and 'mean' not in col: t = row_df[col]; break
@@ -148,55 +145,45 @@ def categorize_failure(text):
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        print("\n--- 📥 NEW PREDICTION REQUEST ---", flush=True)
-        
         data = request.get_json()
         if not isinstance(data, list): data = [data]
         
-        # DEBUG 1: Check Input Size
-        print(f"DEBUG: Received {len(data)} records.", flush=True)
-        
         df_raw = pd.DataFrame(data)
         
-        # DEBUG 2: Check Columns coming from PHP
-        # print(f"DEBUG: Input Columns: {df_raw.columns.tolist()}", flush=True)
-
-        # 1. Align & Reorder Features (Data Prep)
+        # 1. Align & Reorder Features
         df_final = align_features(df_raw, model_features)
 
-        # DEBUG 3: Check Data Going INTO Model (Critical)
-        # This tells us if we are feeding the model "0s" or real numbers
-        print("DEBUG: Sample Input Row (ID 0):", flush=True)
-        # Convert first row to dictionary and print specific keys to avoid log clutter
-        row_dict = df_final.iloc[0].to_dict()
-        keys_to_check = ['avg_peak_temp', 'avg_peak_temp_roll_mean_14d', 'avg_peak_temp_roll_std_14d', 'voltage_instability']
-        filtered_debug = {k: row_dict.get(k, 'N/A') for k in keys_to_check}
-        print(f"      -> {filtered_debug}", flush=True)
+        # --- DEBUG: SCAN FOR DANGER ---
+        # We assume danger if Voltage > 15% unstable OR Temp > 80C
+        # We print these rows explicitly to verify the PHP is sending bad data
+        for idx, row in df_final.iterrows():
+            # Check Voltage Instability (usually index 6 in strict order, but we use name)
+            v = row.get('voltage_instability', 0)
+            t = row.get('avg_peak_temp', 0)
+            
+            if v > 0.10 or t > 80:
+                print(f"⚠️ DANGER INPUT DETECTED [Row {idx}]: Temp={t:.1f}, VoltInst={v:.3f}", flush=True)
 
-        # 2. Predict (PURE AI - No Manual Rules)
+        # 2. Predict
         probabilities = pipeline.predict_proba(df_final)[:, 1]
-
-        # DEBUG 4: Check Raw Probabilities
-        print(f"DEBUG: Raw AI Probabilities: {probabilities}", flush=True)
 
         results = []
         for i, prob in enumerate(probabilities):
             prob_val = float(prob)
             
-            # 3. Determine Status (Strictly > 0.60)
             if prob_val > 0.60:
                 status = "Need Attention"
                 risk_level = "High" 
                 is_risk_high = True
+                # Log High Risk Predictions
+                print(f"🔥 HIGH RISK PREDICTION [Row {i}]: Probability {prob_val:.4f}", flush=True)
             else:
                 status = "Normal"
                 risk_level = "Low"
                 is_risk_high = False
 
-            # 4. Run Diagnostics (For UI explanation only)
             root_cause = get_root_cause(df_final.iloc[i], is_high_risk=is_risk_high)
             
-            # 5. Categorize
             if is_risk_high:
                 category = categorize_failure(root_cause)
             else:
@@ -210,14 +197,10 @@ def predict():
                 'root_cause': root_cause
             })
             
-        print("--- ✅ REQUEST COMPLETE ---\n", flush=True)
-
         return jsonify(results)
 
     except Exception as e:
         print(f"[ERROR] {e}", flush=True)
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':

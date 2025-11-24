@@ -20,10 +20,10 @@ try:
     data_pkg = joblib.load(model_path)
     pipeline = data_pkg['pipeline']
     model_features = data_pkg['features']
-    print(f"[SUCCESS] Loaded Model with {len(model_features)} features.")
-    print(f"[INFO] MODEL EXPECTS: {model_features}")
+    print(f"[SUCCESS] Loaded Model with {len(model_features)} features.", flush=True)
+    print(f"[INFO] MODEL EXPECTS: {model_features}", flush=True)
 except FileNotFoundError:
-    print(f"[FATAL] '{MODEL_FILE}' not found.")
+    print(f"[FATAL] '{MODEL_FILE}' not found.", flush=True)
     sys.exit(1)
 
 # --- INTELLIGENT FEATURE ALIGNER ---
@@ -148,16 +148,36 @@ def categorize_failure(text):
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
+        print("\n--- 📥 NEW PREDICTION REQUEST ---", flush=True)
+        
         data = request.get_json()
         if not isinstance(data, list): data = [data]
         
+        # DEBUG 1: Check Input Size
+        print(f"DEBUG: Received {len(data)} records.", flush=True)
+        
         df_raw = pd.DataFrame(data)
         
+        # DEBUG 2: Check Columns coming from PHP
+        # print(f"DEBUG: Input Columns: {df_raw.columns.tolist()}", flush=True)
+
         # 1. Align & Reorder Features (Data Prep)
         df_final = align_features(df_raw, model_features)
 
+        # DEBUG 3: Check Data Going INTO Model (Critical)
+        # This tells us if we are feeding the model "0s" or real numbers
+        print("DEBUG: Sample Input Row (ID 0):", flush=True)
+        # Convert first row to dictionary and print specific keys to avoid log clutter
+        row_dict = df_final.iloc[0].to_dict()
+        keys_to_check = ['avg_peak_temp', 'avg_peak_temp_roll_mean_14d', 'avg_peak_temp_roll_std_14d', 'voltage_instability']
+        filtered_debug = {k: row_dict.get(k, 'N/A') for k in keys_to_check}
+        print(f"      -> {filtered_debug}", flush=True)
+
         # 2. Predict (PURE AI - No Manual Rules)
         probabilities = pipeline.predict_proba(df_final)[:, 1]
+
+        # DEBUG 4: Check Raw Probabilities
+        print(f"DEBUG: Raw AI Probabilities: {probabilities}", flush=True)
 
         results = []
         for i, prob in enumerate(probabilities):
@@ -189,15 +209,17 @@ def predict():
                 'failure_category': category,
                 'root_cause': root_cause
             })
+            
+        print("--- ✅ REQUEST COMPLETE ---\n", flush=True)
 
         return jsonify(results)
 
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print(f"[ERROR] {e}", flush=True)
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    print("Starting Diagnostic Server on Port 5000...")
+    print("Starting Diagnostic Server on Port 5000...", flush=True)
     serve(app, host='0.0.0.0', port=5000)
